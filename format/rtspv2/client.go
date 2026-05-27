@@ -845,7 +845,7 @@ func (client *RTSPClient) CodecUpdateVPS(val []byte) {
 // Println mini logging functions
 func (client *RTSPClient) Println(v ...interface{}) {
 	if client.options.Debug {
-		log.Println(v)
+		log.Println(v...)
 	}
 }
 
