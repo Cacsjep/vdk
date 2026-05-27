@@ -61,8 +61,63 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 		return client.handleVideo(content)
 	case client.audioID:
 		return client.handleAudio(content)
+	case client.metadataID:
+		client.handleMetadata(content)
+		return nil, false
 	}
 	return nil, false
+}
+
+// handleMetadata reassembles ONVIF MetadataStream XML documents across RTP
+// packets. Per the ONVIF Streaming Specification §5.2, fragments of one XML
+// document share an RTP timestamp and the document terminates on the packet
+// whose marker bit is set. Complete documents are pushed to OutgoingMetadataQueue.
+func (client *RTSPClient) handleMetadata(content []byte) {
+	// RTP marker bit is the high bit of the second RTP header byte. The
+	// interleaved frame prefix occupies content[0:4], so the marker byte is
+	// content[5].
+	marker := (content[5] & 0x80) != 0
+	ts := uint32(client.timestamp)
+
+	// New timestamp means a new document. Drop any partial buffer from a lost
+	// final-marker packet of a previous document.
+	if client.metadataHas && client.metadataTS != ts {
+		client.metadataBuf.Reset()
+	}
+	client.metadataTS = ts
+	client.metadataHas = true
+
+	if client.offset < client.end {
+		client.metadataBuf.Write(content[client.offset:client.end])
+	}
+
+	if !marker {
+		return
+	}
+
+	// Copy out the assembled document and reset for the next one.
+	doc := make([]byte, client.metadataBuf.Len())
+	copy(doc, client.metadataBuf.Bytes())
+	client.metadataBuf.Reset()
+	client.metadataHas = false
+
+	if client.OutgoingMetadataQueue == nil {
+		return
+	}
+	// Non-blocking: drop the oldest doc if the consumer can not keep up. PTZ
+	// telemetry tolerates loss; back-pressure would stall the RTSP reader.
+	select {
+	case client.OutgoingMetadataQueue <- doc:
+	default:
+		select {
+		case <-client.OutgoingMetadataQueue:
+		default:
+		}
+		select {
+		case client.OutgoingMetadataQueue <- doc:
+		default:
+		}
+	}
 }
 
 func (client *RTSPClient) handleVideo(content []byte) ([]*av.Packet, bool) {

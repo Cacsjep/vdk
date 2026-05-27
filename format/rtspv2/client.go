@@ -32,8 +32,9 @@ const (
 )
 
 const (
-	VIDEO = "video"
-	AUDIO = "audio"
+	VIDEO    = "video"
+	AUDIO    = "audio"
+	METADATA = "application" // ONVIF timed metadata; some firmware emits "metadata" instead, see metaAVTypeMatch.
 )
 
 const (
@@ -73,29 +74,50 @@ type RTSPClient struct {
 	Signals             chan int
 	OutgoingProxyQueue  chan *[]byte
 	OutgoingPacketQueue chan *av.Packet
-	clientDigest        bool
-	clientBasic         bool
-	fuStarted           bool
-	options             RTSPClientOptions
-	BufferRtpPacket     *bytes.Buffer
-	vps                 []byte
-	sps                 []byte
-	pps                 []byte
-	CodecData           []av.CodecData
-	AudioTimeLine       time.Duration
-	AudioTimeScale      int64
-	audioCodec          av.CodecType
-	videoCodec          av.CodecType
-	PreAudioTS          int64
-	PreVideoTS          int64
-	PreSequenceNumber   int
-	FPS                 int
-	WaitCodec           bool
-	chTMP               int
-	timestamp           int64
-	sequenceNumber      int
-	end                 int
-	offset              int
+	// OutgoingMetadataQueue carries fully reassembled ONVIF MetadataStream
+	// XML documents (one document = one channel send). vdk handles RTP marker
+	// bit reassembly internally; consumers just parse the XML.
+	// Nil if the SDP did not advertise an application/metadata track.
+	OutgoingMetadataQueue chan []byte
+	// MetadataAvailable is true after Dial() if at least one application
+	// or metadata track was set up successfully.
+	MetadataAvailable bool
+	clientDigest      bool
+	clientBasic       bool
+	fuStarted         bool
+	options           RTSPClientOptions
+	BufferRtpPacket   *bytes.Buffer
+	vps               []byte
+	sps               []byte
+	pps               []byte
+	CodecData         []av.CodecData
+	AudioTimeLine     time.Duration
+	AudioTimeScale    int64
+	audioCodec        av.CodecType
+	videoCodec        av.CodecType
+	PreAudioTS        int64
+	PreVideoTS        int64
+	PreSequenceNumber int
+	FPS               int
+	WaitCodec         bool
+	chTMP             int
+	timestamp         int64
+	sequenceNumber    int
+	end               int
+	offset            int
+
+	// Metadata reassembly state, used only when an application/metadata
+	// track is present.
+	metadataID  int
+	metadataBuf bytes.Buffer
+	metadataTS  uint32
+	metadataHas bool // true once metadataTS holds a real value
+}
+
+// isMetadataAVType reports whether a SDP m= type string identifies an ONVIF
+// timed metadata track. Different Axis firmware versions emit different spellings.
+func isMetadataAVType(t string) bool {
+	return t == METADATA || t == "metadata"
 }
 
 type RTSPClientOptions struct {
@@ -110,17 +132,19 @@ type RTSPClientOptions struct {
 
 func Dial(options RTSPClientOptions) (*RTSPClient, error) {
 	client := &RTSPClient{
-		headers:             make(map[string]string),
-		Signals:             make(chan int, 100),
-		OutgoingProxyQueue:  make(chan *[]byte, 3000),
-		OutgoingPacketQueue: make(chan *av.Packet, 3000),
-		BufferRtpPacket:     bytes.NewBuffer([]byte{}),
-		videoID:             -1,
-		audioID:             -2,
-		videoIDX:            -1,
-		audioIDX:            -2,
-		options:             options,
-		AudioTimeScale:      8000,
+		headers:               make(map[string]string),
+		Signals:               make(chan int, 100),
+		OutgoingProxyQueue:    make(chan *[]byte, 3000),
+		OutgoingPacketQueue:   make(chan *av.Packet, 3000),
+		OutgoingMetadataQueue: make(chan []byte, 256),
+		BufferRtpPacket:       bytes.NewBuffer([]byte{}),
+		videoID:               -1,
+		audioID:               -2,
+		metadataID:            -3,
+		videoIDX:              -1,
+		audioIDX:              -2,
+		options:               options,
+		AudioTimeScale:        8000,
 	}
 	client.headers["User-Agent"] = "Lavf58.76.100"
 	err := client.parseURL(html.UnescapeString(client.options.URL))
@@ -154,7 +178,8 @@ func Dial(options RTSPClientOptions) (*RTSPClient, error) {
 		return nil, err
 	}
 	for _, i2 := range client.mediaSDP {
-		if (i2.AVType != VIDEO && i2.AVType != AUDIO) || (client.options.DisableAudio && i2.AVType == AUDIO) {
+		isMeta := isMetadataAVType(i2.AVType)
+		if (i2.AVType != VIDEO && i2.AVType != AUDIO && !isMeta) || (client.options.DisableAudio && i2.AVType == AUDIO) {
 			//TODO check it
 			if strings.Contains(string(client.SDPRaw), "LaunchDigital") {
 				client.chTMP += 2
@@ -164,6 +189,16 @@ func Dial(options RTSPClientOptions) (*RTSPClient, error) {
 		err = client.request(SETUP, map[string]string{"Transport": "RTP/AVP/TCP;unicast;interleaved=" + strconv.Itoa(client.chTMP) + "-" + strconv.Itoa(client.chTMP+1)}, client.ControlTrack(i2.Control), false, false)
 		if err != nil {
 			return nil, err
+		}
+		if isMeta {
+			// ONVIF timed metadata track. We do not parse codec data; the
+			// payload is XML reassembled per RTP marker bit and surfaced via
+			// OutgoingMetadataQueue. CodecData is intentionally left untouched
+			// so video/audio-only consumers keep working.
+			client.metadataID = client.chTMP
+			client.MetadataAvailable = true
+			client.chTMP += 2
+			continue
 		}
 		if i2.AVType == VIDEO {
 			if i2.Type == av.H264 {
