@@ -22,7 +22,10 @@ func (client *RTSPClient) RTPDemuxer(payloadRAW *[]byte) ([]*av.Packet, bool) {
 	extension := (firstByte>>4)&1 == 1
 	CSRCCnt := int(firstByte & 0x0f)
 	client.sequenceNumber = int(binary.BigEndian.Uint16(content[6:8]))
-	client.timestamp = int64(binary.BigEndian.Uint32(content[8:16]))
+	// RFC 3550 §5.1: the RTP timestamp is a 4-byte field at offset 4..7 of the
+	// RTP header, which lands at content[8..11] after the 4-byte interleaved
+	// frame prefix. Backports upstream PR #119.
+	client.timestamp = int64(binary.BigEndian.Uint32(content[8:12]))
 
 	if isRTCPPacket(content) {
 		client.Println("skipping RTCP packet")
@@ -174,7 +177,11 @@ func (client *RTSPClient) handleH264Payload(content, nal []byte, retmap []*av.Pa
 		packet := nal[1:]
 		for len(packet) >= 2 {
 			size := int(packet[0])<<8 | int(packet[1])
-			if size+2 > len(packet) {
+			// size == 0 is malformed (RFC 6184 §5.7.1: STAP-A NAL unit size
+			// must be > 0) and would cause packet[2] below to read out of
+			// bounds when len(packet) == 2. Fixes upstream issue #114
+			// (process-killing panic inside the Dial goroutine).
+			if size == 0 || size+2 > len(packet) {
 				break
 			}
 			naluTypefs := packet[2] & 0x1f
@@ -281,14 +288,29 @@ func (client *RTSPClient) handleAudio(content []byte) ([]*av.Packet, bool) {
 			duration = time.Duration(20) * time.Millisecond
 			retmap = client.appendAudioPacket(retmap, nal, duration)
 		case av.AAC:
+			// Bounds checks backport upstream PR #126: malformed AAC RTP
+			// packets used to panic inside the goroutine spawned by Dial,
+			// which the caller can not recover from.
+			if len(nal) < 2 {
+				break
+			}
 			auHeadersLength := uint16(0) | (uint16(nal[0]) << 8) | uint16(nal[1])
 			auHeadersCount := auHeadersLength >> 4
 			framesPayloadOffset := 2 + int(auHeadersCount)<<1
+			if framesPayloadOffset > len(nal) {
+				break
+			}
 			auHeaders := nal[2:framesPayloadOffset]
 			framesPayload := nal[framesPayloadOffset:]
 			for i := 0; i < int(auHeadersCount); i++ {
+				if len(auHeaders) < 2 {
+					break
+				}
 				auHeader := uint16(0) | (uint16(auHeaders[0]) << 8) | uint16(auHeaders[1])
 				frameSize := auHeader >> 3
+				if int(frameSize) > len(framesPayload) {
+					break
+				}
 				frame := framesPayload[:frameSize]
 				auHeaders = auHeaders[2:]
 				framesPayload = framesPayload[frameSize:]

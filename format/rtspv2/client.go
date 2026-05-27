@@ -593,7 +593,7 @@ func (client *RTSPClient) request(method string, customHeaders map[string]string
 				if splits[0] == "Content-length" {
 					splits[0] = "Content-Length"
 				}
-				res[splits[0]] = splits[1]
+				mergeResponseHeader(res, splits[0], splits[1])
 			}
 		}
 		if val, ok := res["WWW-Authenticate"]; ok {
@@ -698,7 +698,14 @@ func (client *RTSPClient) parseURL(rawURL string) error {
 	password, _ := l.User.Password()
 	l.User = nil
 	if l.Port() == "" {
-		l.Host = fmt.Sprintf("%s:%s", l.Host, "554")
+		// RFC 7826 §4.2 defines 322 as the default port for rtsps and 554 for
+		// rtsp. Backports upstream PR #118.
+		switch l.Scheme {
+		case "rtsps":
+			l.Host = fmt.Sprintf("%s:%s", l.Host, "322")
+		default:
+			l.Host = fmt.Sprintf("%s:%s", l.Host, "554")
+		}
 	}
 	if l.Scheme != "rtsp" && l.Scheme != "rtsps" {
 		l.Scheme = "rtsp"
@@ -840,6 +847,24 @@ func (client *RTSPClient) CodecUpdateVPS(val []byte) {
 
 	client.Signals <- SignalCodecUpdate
 
+}
+
+// mergeResponseHeader writes the parsed (key, value) into the RTSP response
+// header map. For WWW-Authenticate it preserves a prior Digest value when a
+// later Basic value arrives: RFC 7235 §2.1 instructs clients to select the
+// strongest scheme the server offered. Some Axis cameras advertise both and
+// without this preference whichever arrives last in the response would win
+// (a plain map assignment), which can downgrade a session to Basic auth.
+// Backports upstream PR #104.
+func mergeResponseHeader(res map[string]string, key, value string) {
+	if existing, ok := res[key]; ok {
+		if key == "WWW-Authenticate" &&
+			strings.Contains(existing, "Digest") &&
+			strings.Contains(value, "Basic") {
+			return
+		}
+	}
+	res[key] = value
 }
 
 // Println mini logging functions
